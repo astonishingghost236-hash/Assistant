@@ -70,6 +70,46 @@ function getRecognitionConstructor(): RecognitionConstructor | undefined {
   return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
 }
 
+async function convertToWav(recording: Blob): Promise<Blob> {
+  const audioContext = new AudioContext();
+  try {
+    const decoded = await audioContext.decodeAudioData(await recording.arrayBuffer());
+    const sampleRate = 16_000;
+    const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * sampleRate), sampleRate);
+    const source = offline.createBufferSource();
+    source.buffer = decoded;
+    source.connect(offline.destination);
+    source.start();
+    const resampled = await offline.startRendering();
+    const samples = resampled.getChannelData(0);
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+    const writeText = (offset: number, value: string) => {
+      for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
+    };
+    writeText(0, "RIFF");
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeText(8, "WAVE");
+    writeText(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeText(36, "data");
+    view.setUint32(40, samples.length * 2, true);
+    for (let index = 0; index < samples.length; index += 1) {
+      const sample = Math.max(-1, Math.min(1, samples[index]));
+      view.setInt16(44 + index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+    }
+    return new Blob([buffer], { type: "audio/wav" });
+  } finally {
+    await audioContext.close();
+  }
+}
+
 function App() {
   const [messages, setMessages] = useState<ChatMessage[]>(greetings);
   const [input, setInput] = useState("");
@@ -85,8 +125,17 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [recognitionSupported, setRecognitionSupported] = useState(true);
   const [configured, setConfigured] = useState<boolean | null>(null);
+  const [providerName, setProviderName] = useState<string | null>(null);
+  const [providerFallbackAvailable, setProviderFallbackAvailable] = useState(false);
+  const [consentOpen, setConsentOpen] = useState(false);
+  const [providerRecording, setProviderRecording] = useState(false);
 
   const recognitionRef = useRef<Recognition | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const cancelRecordingRef = useRef(false);
+  const recordingTimeoutRef = useRef<number | undefined>(undefined);
   const pauseTimerRef = useRef<number | undefined>(undefined);
   const transcriptRef = useRef("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -104,14 +153,20 @@ function App() {
     const recognitionAvailable = Boolean(getRecognitionConstructor());
     setRecognitionSupported(recognitionAvailable);
     void fetch("/api/health")
-      .then((result) => result.json() as Promise<{ configured: boolean }>)
-      .then((health) => setConfigured(health.configured))
+      .then((result) => result.json() as Promise<{ configured: boolean; provider?: string }>)
+      .then((health) => {
+        setConfigured(health.configured);
+        setProviderName(health.provider ?? null);
+      })
       .catch(() => setConfigured(false));
     return () => {
       window.speechSynthesis?.removeEventListener("voiceschanged", updateVoices);
       window.speechSynthesis?.cancel();
       window.clearTimeout(pauseTimerRef.current);
+      window.clearTimeout(recordingTimeoutRef.current);
       recognitionRef.current?.abort();
+      recorderRef.current?.stop();
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
 
@@ -151,9 +206,9 @@ function App() {
   );
 
   const sendMessage = useCallback(
-    async (rawText: string) => {
+    async (rawText: string, allowDuringThinking = false) => {
       const content = rawText.trim();
-      if (!content || stateRef.current === "thinking") return;
+      if (!content || (stateRef.current === "thinking" && !allowDuringThinking)) return;
       window.clearTimeout(pauseTimerRef.current);
       transcriptRef.current = "";
       setInterim("");
@@ -200,6 +255,100 @@ function App() {
     [messages, speak],
   );
 
+  const startProviderRecording = async () => {
+    setConsentOpen(false);
+    setError("");
+    setProviderFallbackAvailable(false);
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setError("Audio recording isn't supported in this browser. You can type your message instead.");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+      const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"]
+        .find((type) => MediaRecorder.isTypeSupported(type));
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      cancelRecordingRef.current = false;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) audioChunksRef.current.push(event.data);
+      };
+      recorder.onerror = () => {
+        setError("Recording failed. Check microphone permissions or type your message instead.");
+        setAssistantState("idle");
+        setProviderRecording(false);
+        stream.getTracks().forEach((track) => track.stop());
+      };
+      recorder.onstop = async () => {
+        window.clearTimeout(recordingTimeoutRef.current);
+        setProviderRecording(false);
+        mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+        if (cancelRecordingRef.current) {
+          cancelRecordingRef.current = false;
+          audioChunksRef.current = [];
+          setAssistantState("idle");
+          setInterim("");
+          return;
+        }
+
+        const recording = new Blob(audioChunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        audioChunksRef.current = [];
+        if (recording.size === 0) {
+          setAssistantState("idle");
+          setError("No audio was captured. Please try again.");
+          return;
+        }
+        setAssistantState("thinking");
+        setInterim("");
+        try {
+          const audio = await convertToWav(recording);
+          const response = await fetch("/api/transcribe", {
+            method: "POST",
+            headers: {
+              "Content-Type": audio.type.split(";")[0] || "audio/webm",
+              "X-Speech-Language": language === "hi-IN" ? "hi-IN" : language === "en-US" ? "en-US" : "auto",
+            },
+            body: audio,
+          });
+          const result = (await response.json()) as { text?: string; error?: string };
+          if (!response.ok || !result.text) {
+            throw new Error(result.error ?? "Audio transcription failed. Please try again or type your message.");
+          }
+          await sendMessage(result.text, true);
+        } catch (requestError) {
+          setAssistantState("idle");
+          setError(requestError instanceof Error ? requestError.message : "Audio transcription failed. Please try again.");
+        }
+      };
+      recorderRef.current = recorder;
+      recorder.start(250);
+      setProviderRecording(true);
+      setAssistantState("listening");
+      setInterim("Recording on this device. Stop to send audio for transcription.");
+      recordingTimeoutRef.current = window.setTimeout(() => recorder.stop(), 90_000);
+    } catch (recordingError) {
+      setAssistantState("idle");
+      setError(
+        recordingError instanceof DOMException && recordingError.name === "NotAllowedError"
+          ? "Microphone access was denied. Allow microphone access in your browser settings, or type a message."
+          : "Couldn't start audio recording. Check your microphone and browser permissions.",
+      );
+    }
+  };
+
+  const stopProviderRecording = () => {
+    window.clearTimeout(recordingTimeoutRef.current);
+    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+  };
+
+  const cancelProviderRecording = () => {
+    cancelRecordingRef.current = true;
+    window.clearTimeout(recordingTimeoutRef.current);
+    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+  };
+
   const startListening = () => {
     if (!recognitionSupported || assistantState === "thinking") {
       if (!recognitionSupported) setError("Speech recognition isn't supported in this browser. You can type instead.");
@@ -244,6 +393,9 @@ function App() {
       recognition.onerror = (event) => {
         if (event.error === "not-allowed" || event.error === "service-not-allowed") {
           setError("Microphone access was denied. Allow microphone access in your browser settings, or type a message.");
+        } else if (event.error === "network") {
+          setProviderFallbackAvailable(true);
+          setError("The browser speech service is unreachable. Retry, use provider transcription, or type a message.");
         } else if (event.error !== "no-speech" && event.error !== "aborted") {
           setError(`Speech recognition error: ${event.error}. You can try again or type your message.`);
         }
@@ -289,7 +441,8 @@ function App() {
   };
 
   const toggleMicrophone = () => {
-    if (assistantState === "listening") stopListening();
+    if (providerRecording) stopProviderRecording();
+    else if (assistantState === "listening") stopListening();
     else startListening();
   };
 
@@ -347,7 +500,7 @@ function App() {
               {interim && assistantState === "listening" && (
                 <article className="message-row user interim-row">
                   <div className="message-body">
-                    <div className="message-meta"><span>You</span><span className="live-label">LIVE TRANSCRIPT</span></div>
+                    <div className="message-meta"><span>You</span><span className="live-label">{providerRecording ? "LOCAL RECORDING" : "LIVE TRANSCRIPT"}</span></div>
                     <p>{interim}<span className="cursor">|</span></p>
                   </div>
                 </article>
@@ -363,7 +516,19 @@ function App() {
               )}
               <div ref={messagesEndRef} />
             </div>
-            {error && <div className="error-banner" role="alert"><span>!</span>{error}</div>}
+            {error && (
+              <div className="error-banner" role="alert">
+                <span>!</span>
+                <div>
+                  {error}
+                  {providerFallbackAvailable && (
+                    <button className="fallback-button" onClick={() => setConsentOpen(true)}>
+                      Use provider transcription
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="composer-area">
@@ -385,12 +550,22 @@ function App() {
                 <button
                   className={`mic-button ${assistantState === "listening" ? "is-listening" : ""}`}
                   onClick={toggleMicrophone}
-                  aria-label={assistantState === "listening" ? "Stop listening and send" : "Start talking"}
+                  aria-label={providerRecording ? "Stop recording and transcribe" : assistantState === "listening" ? "Stop listening and send" : "Start talking"}
                   disabled={assistantState === "thinking" || !recognitionSupported}
                   title={!recognitionSupported ? "Speech recognition is not supported in this browser" : "Talk to Solace"}
                 >
                   {assistantState === "listening" ? <StopIcon /> : <MicIcon />}
                 </button>
+                {providerRecording && (
+                  <button className="stop-speech-button" onClick={cancelProviderRecording}>
+                    Cancel recording
+                  </button>
+                )}
+                {!recognitionSupported && !providerRecording && (
+                  <button className="stop-speech-button" onClick={() => setConsentOpen(true)}>
+                    Use provider transcription
+                  </button>
+                )}
                 {assistantState === "speaking" && (
                   <button className="stop-speech-button" onClick={stopSpeaking}><StopIcon /> Stop speaking</button>
                 )}
@@ -464,7 +639,7 @@ function App() {
               <li><CheckIcon /> No saved chat history</li>
               <li><CheckIcon /> AI key stays on the server</li>
             </ul>
-            <p>Speech recognition is provided by your browser. Transcripts are sent to your configured AI provider to generate replies.</p>
+            <p>Browser speech recognition is used first. With your consent, fallback recordings are sent to your configured provider for transcription. Solace does not retain audio.</p>
           </section>
 
           {configured === false && (
@@ -510,6 +685,28 @@ function App() {
           </button>
           <p className="drawer-status">Speech recognition: {recognitionSupported ? "Available in this browser" : "Not supported; typing remains available"}</p>
           <button className="drawer-clear" onClick={() => { clearConversation(); setSettingsOpen(false); }}><TrashIcon /> Clear conversation</button>
+        </div>
+      )}
+      {consentOpen && (
+        <div className="consent-backdrop">
+          <section className="consent-dialog" role="dialog" aria-modal="true" aria-labelledby="audio-consent-title">
+            <div className="consent-mark"><LockIcon /></div>
+            <p className="eyebrow">OPTIONAL AUDIO TRANSCRIPTION</p>
+            <h2 id="audio-consent-title">Send a voice message?</h2>
+            <p>Your browser's speech service is unreachable. If you continue, Solace will record until you stop, then upload that recording to the AI provider configured on your server for transcription. Solace does not save the recording. Your provider may process it under its own privacy terms or charge for audio requests.</p>
+            {configured !== true && (
+              <p className="consent-key-note">Add a valid <code>LLM_API_KEY</code> to your local <code>.env</code> and restart the server before using provider transcription.</p>
+            )}
+            {providerName === "OpenRouter" && (
+              <p className="consent-key-note">OpenRouter reported this account needs at least $0.50 in balance to process audio. Add credits in its dashboard; free chat models do not cover audio requests.</p>
+            )}
+            <div className="consent-actions">
+              <button className="consent-cancel" onClick={() => setConsentOpen(false)}>Cancel</button>
+              <button className="consent-accept" onClick={() => void startProviderRecording()} disabled={configured !== true}>
+                I agree — start recording
+              </button>
+            </div>
+          </section>
         </div>
       )}
     </main>
