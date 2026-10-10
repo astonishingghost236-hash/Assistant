@@ -37,6 +37,17 @@ A private-by-default voice and text assistant built with React, TypeScript, Vite
 
 For a production bundle, run `npm run build`. Run the API server with `npm start`; serve the generated `dist/` directory from a static host or reverse proxy `/api` requests to the server.
 
+## Deploy to Vercel
+
+This is a React + Vite frontend with an Express API adapted to a Vercel Function. The root `vercel.json` selects the correct Vite preset and build output; do not choose VitePress.
+
+1. Import this repository into Vercel and set **Root Directory** to `./` (the repository root). The framework should be **Vite**. If the dashboard still shows VitePress, select **Vite** manually.
+2. Use **Install Command** `npm install`, **Build Command** `npm run build`, and **Output Directory** `dist`.
+3. In Vercel Project → **Settings → Environment Variables**, add `LLM_API_KEY` with your newly rotated provider key. Add `LLM_BASE_URL`, `LLM_MODEL`, and `LLM_TRANSCRIPTION_MODEL` using the values in `.env.example`. Do not add a `VITE_` prefix to secret variables.
+4. Redeploy after saving the environment variables. Verify `https://<your-deployment>/api/health` reports `"configured":true` and `"provider":"OpenRouter"`.
+
+The Vercel function serves `/api/health`, `/api/chat`, and `/api/transcribe`; Vite builds the static frontend into `dist`. Your local `.env` is not uploaded by Git and does not configure Vercel automatically.
+
 ## Features
 
 - English, Hindi, and Hinglish chat instructions, with browser speech recognition language selection and language auto-detection for speech playback.
